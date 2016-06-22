@@ -10,13 +10,19 @@ from ase.calculators.calculator import Calculator
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read
 from ase.optimize import BFGS
-from ase.geometry import find_mic
+from ase.utils.geometry import find_mic
 
 
 class NEB:
     def __init__(self, images, k=0.1, climb=False, parallel=False,
-                 remove_rotation_and_translation=False, world=None):
+                 remove_rotation_and_translation=False, world=None,
+                 method='aseneb'):
         """Nudged elastic band.
+        Paper I: G. Henkelman and H. Jonsson, Chem. Phys, 113, 9978 (2000).
+        Paper II: G. Henkelman, B. P. Uberuaga, and H. Jonsson, Chem. Phys,
+                  113, 9901 (2000).
+        Paper III: E. L. Kolsbjerg, M. N. Groves, and B. Hammer, J. Chem. Phys,
+                   submitted (2016)
 
         images: list of Atoms objects
             Images defining path from initial to final state.
@@ -30,6 +36,11 @@ class NEB:
             TRUE actives NEB-TR for removing translation and
             rotation during NEB. By default applied non-periodic
             systems
+        method: string of method
+            Choice betweeen three method:
+            'aseneb', standard ase NEB implementation
+            'improvedtangent', Paper I NEB implementation
+            'eb', Paper III full spring force implementation
         """
         self.images = images
         self.climb = climb
@@ -37,13 +48,18 @@ class NEB:
         self.natoms = len(images[0])
         self.nimages = len(images)
         self.emax = np.nan
-        
+
         self.remove_rotation_and_translation = remove_rotation_and_translation
-        
+
+        if method in ['aseneb', 'eb', 'improvedtangent']:
+            self.method = method
+        else:
+            raise NotImplementedError(method)
+
         if isinstance(k, (float, int)):
             k = [k] * (self.nimages - 1)
         self.k = list(k)
-
+        
         if world is None:
             world = mpi.world
         self.world = world
@@ -54,9 +70,9 @@ class NEB:
     def interpolate(self, method='linear', mic=False):
         if self.remove_rotation_and_translation:
             minimize_rotation_and_translation(self.images[0], self.images[-1])
-        
+
         interpolate(self.images, mic)
-                 
+
         if method == 'idpp':
             self.idpp_interpolate(traj=None, log=None, mic=mic)
 
@@ -95,23 +111,26 @@ class NEB:
                 image.get_calculator().set_atoms(image)
             except AttributeError:
                 pass
-
+    
     def get_forces(self):
         """Evaluate and return the forces."""
         images = self.images
         forces = np.empty(((self.nimages - 2), self.natoms, 3))
-        energies = np.empty(self.nimages - 2)
-
+        energies = np.empty(self.nimages)
+        
         if self.remove_rotation_and_translation:
             # Remove translation and rotation between
             # images before computing forces:
             for i in range(1, self.nimages):
                 minimize_rotation_and_translation(images[i - 1], images[i])
 
+        energies[0] = images[0].get_potential_energy()
+        energies[-1] = images[-1].get_potential_energy()
+
         if not self.parallel:
             # Do all images - one at a time:
             for i in range(1, self.nimages - 1):
-                energies[i - 1] = images[i].get_potential_energy()
+                energies[i] = images[i].get_potential_energy()
                 forces[i - 1] = images[i].get_forces()
         elif self.world.size == 1:
             def run(image, energies, forces):
@@ -119,7 +138,7 @@ class NEB:
                 forces[:] = image.get_forces()
             threads = [threading.Thread(target=run,
                                         args=(images[i],
-                                              energies[i - 1:i],
+                                              energies[i:i + 1],
                                               forces[i - 1:i]))
                        for i in range(1, self.nimages - 1)]
             for thread in threads:
@@ -130,7 +149,7 @@ class NEB:
             # Parallelize over images:
             i = self.world.rank * (self.nimages - 2) // self.world.size + 1
             try:
-                energies[i - 1] = images[i].get_potential_energy()
+                energies[i] = images[i].get_potential_energy()
                 forces[i - 1] = images[i].get_forces()
             except:
                 # Make sure other images also fail:
@@ -143,38 +162,102 @@ class NEB:
 
             for i in range(1, self.nimages - 1):
                 root = (i - 1) * self.world.size // (self.nimages - 2)
-                self.world.broadcast(energies[i - 1:i], root)
+                self.world.broadcast(energies[i:i + 1], root)
                 self.world.broadcast(forces[i - 1], root)
 
-        imax = 1 + np.argsort(energies)[-1]
+        imax = 1 + np.argsort(energies[1:-1])[-1]
         self.emax = energies[imax - 1]
 
-        tangent1 = find_mic(images[1].get_positions() -
-                            images[0].get_positions(),
-                            images[0].get_cell(), images[0].pbc)[0]
-        for i in range(1, self.nimages - 1):
-            tangent2 = find_mic(images[i + 1].get_positions() -
-                                images[i].get_positions(),
-                                images[i].get_cell(),
-                                images[i].pbc)[0]
-            if i < imax:
-                tangent = tangent2
-            elif i > imax:
-                tangent = tangent1
-            else:
-                tangent = tangent1 + tangent2
+        t1 = find_mic(images[1].get_positions() -
+                      images[0].get_positions(),
+                      images[0].get_cell(), images[0].pbc)[0]
 
-            tt = np.vdot(tangent, tangent)
+        if self.method == 'eb':
+            BeeLine = (images[self.nimages - 1].get_positions() -
+                       images[0].get_positions())
+            BeeLineLength = np.linalg.norm(BeeLine)
+            eqLength = BeeLineLength / (self.nimages - 1)
+
+        nt1 = np.linalg.norm(t1)
+
+        for i in range(1, self.nimages - 1):
+            j = i - 1
+
+            t2 = find_mic(images[i + 1].get_positions() -
+                          images[i].get_positions(),
+                          images[i].get_cell(), images[i].pbc)[0]
+            nt2 = np.linalg.norm(t2)
+
+            if self.method == 'eb':
+                # Tangents are bisections of spring-directions
+                # (formula C8 of paper III)
+                tangent = t1 / nt1 + t2 / nt2
+                # Normalize the tangent vector
+                tangent /= np.linalg.norm(tangent)
+            elif self.method == 'improvedtangent':
+                # Tangents are improved according to formulas 8, 9, 10,
+                # and 11 of paper I.
+                if energies[i + 1] > energies[i] > energies[i - 1]:
+                    tangent = t2.copy()
+                elif energies[i + 1] < energies[i] < \
+                        energies[i - 1]:
+                    tangent = t1.copy()
+                else:
+                    DeltaVmax = max(abs(energies[i + 1] - energies[i]),
+                                    abs(energies[i - 1] - energies[i]))
+                    DeltaVmin = min(abs(energies[i + 1] - energies[i]),
+                                    abs(energies[i - 1] - energies[i]))
+                    if energies[i + 1] > energies[i - 1]:
+                        tangent = t2 * DeltaVmax + t1 * DeltaVmin
+                    else:
+                        tangent = t2 * DeltaVmin + t1 * DeltaVmax
+                # Normalize the tangent vector
+                tangent /= np.linalg.norm(tangent)
+            else:
+                if i < imax:
+                    tangent = t2
+                elif i > imax:
+                    tangent = t1
+                else:
+                    tangent = t1 + t2
+                tt = np.vdot(tangent, tangent)
+
             f = forces[i - 1]
             ft = np.vdot(f, tangent)
+            
             if i == imax and self.climb:
-                f -= 2 * ft / tt * tangent
+                # imax not affected by the spring forces. The full force
+                # with component along the elestic band converted
+                # (formula 5 of Paper II)
+                if self.method == 'aseneb':
+                    f -= 2 * ft / tt * tangent
+                else:
+                    f -= 2 * ft * tangent
+            elif self.method == 'eb':
+                f -= ft * tangent
+                # Spring forces
+                # (formula C1, C5, C6 and C7 of Paper III)
+                f1 = -(nt1 - eqLength) * t1 / nt1 * self.k[i - 1]
+                f2 = (nt2 - eqLength) * t2 / nt2 * self.k[i]
+                if self.climb and abs(i - imax) == 1:
+                    DeltaVmax = max(abs(energies[i + 1] - energies[i]),
+                                    abs(energies[i - 1] - energies[i]))
+                    DeltaVmin = min(abs(energies[i + 1] - energies[i]),
+                                    abs(energies[i - 1] - energies[i]))
+                    f += (f1 + f2) * DeltaVmin / DeltaVmax
+                else:
+                    f += f1 + f2
+            elif self.method == 'improvedtangent':
+                f -= ft * tangent
+                # Improved parallel spring force (formula 12 of paper I)
+                f += (nt2 * self.k[i] - nt1 * self.k[i - 1]) * tangent
             else:
                 f -= ft / tt * tangent
-                f -= np.vdot(tangent1 * self.k[i - 1] -
-                             tangent2 * self.k[i], tangent) / tt * tangent
+                f -= np.vdot(t1 * self.k[i - 1] -
+                             t2 * self.k[i], tangent) / tt * tangent
 
-            tangent1 = tangent2
+            t1 = t2
+            nt1 = nt2
 
         return forces.reshape((-1, 3))
 
@@ -189,11 +272,8 @@ class IDPP(Calculator):
     """Image dependent pair potential.
 
     See:
-
         Improved initial guess for minimum energy path calculations.
-
         Søren Smidstrup, Andreas Pedersen, Kurt Stokbro and Hannes Jónsson
-
         Chem. Phys. 140, 214106 (2014)
     """
 
@@ -470,9 +550,9 @@ class NEBtools:
                      % (Ef, Er, dE))
         return fig
 
-    def get_fmax(self, **kwargs):
+    def get_fmax(self):
         """Returns fmax, as used by optimizers with NEB."""
-        neb = NEB(self._images, **kwargs)
+        neb = NEB(self._images)
         forces = neb.get_forces()
         return np.sqrt((forces**2).sum(axis=1).max())
 
